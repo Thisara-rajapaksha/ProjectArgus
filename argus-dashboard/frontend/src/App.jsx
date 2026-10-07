@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 
 const CAMS = ["Front door", "Garage", "Back yard", "Lobby", "Parking", "Side gate"].map((name, i) => ({ id: i + 1, name }));
 const W = 16, H = 9; // zones live in a 16x9 space so circles stay round
@@ -9,6 +9,16 @@ const ago = ts => {
   return s < 10 ? "Just now" : s < 60 ? `${s} seconds ago` : s < 3600 ? `${Math.floor(s / 60)} minutes ago`
     : new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
+const api = (url, method = "GET", body) =>
+  fetch(url, { method, headers: { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) })
+    .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
+const toPoly = s => {          // the backend takes polygons with x, y in 0..1
+  const n = ([x, y]) => [x / W, y / H];
+  if (s.t === "rect") return [[s.x, s.y], [s.x + s.w, s.y], [s.x + s.w, s.y + s.h], [s.x, s.y + s.h]].map(n);
+  if (s.t === "circle") return Array.from({ length: 48 }, (_, i) => n([s.cx + s.r * Math.cos((i / 48) * 2 * Math.PI), s.cy + s.r * Math.sin((i / 48) * 2 * Math.PI)]));
+  return s.pts.map(n);
+};
+const COLORS = ["red", "orange", "yellow", "green", "blue"];
 const kind = s => (s.t === "rect" ? "Rectangle" : s.t === "circle" ? "Circle" : "Polygon");
 
 function inside(s, x, y) {
@@ -31,68 +41,27 @@ const Icon = ({ n }) => (
   </svg>
 );
 
-function useWebcam() {
-  const [stream, setStream] = useState(null);
-  const [error, setError] = useState("");
+function useBackend() {
+  const [health, setHealth] = useState(null);
+  const [events, setEvents] = useState([]);
   useEffect(() => {
-    let s, gone = false;
-    const why = {
-      NotAllowedError: "The browser blocked the camera. Click the lock icon in the address bar, set Camera to Allow, and reload.",
-      NotReadableError: "Another program is using the webcam, so the browser can't open it. Stop the Flask backend (python app.py) and any other app using the camera, then reload.",
-      NotFoundError: "No webcam was found on this computer.",
-      OverconstrainedError: "The webcam doesn't support the requested size.",
-    };
-    if (!navigator.mediaDevices?.getUserMedia) { setError("This page can't use the camera. Open it on localhost or https."); return; }
-    navigator.mediaDevices.getUserMedia({ video: true })
-      .then(m => (gone ? m.getTracks().forEach(t => t.stop()) : (s = m, setStream(m))))
-      .catch(e => setError((why[e.name] || "Could not open the webcam.") + ` (${e.name})`));
-    return () => { gone = true; s?.getTracks().forEach(t => t.stop()); };
+    const load = () => api("/api/health").then(setHealth).catch(() => setHealth(null));
+    load();
+    const t = setInterval(load, 2000);
+    const es = new EventSource("/api/events/stream");        // new alerts arrive instantly
+    es.onmessage = m => setEvents(l => [JSON.parse(m.data), ...l].slice(0, 50));
+    return () => { clearInterval(t); es.close(); };
   }, []);
-  return { stream, error };
+  useEffect(() => { if (health) api("/api/events").then(setEvents).catch(() => {}); }, [!!health]);
+  const ack = ids => {
+    setEvents(l => l.map(e => (ids.includes(e.id) ? { ...e, status: "acknowledged" } : e)));
+    ids.forEach(id => api(`/api/events/${id}/ack`, "POST", {}).catch(() => {}));
+  };
+  return { health, setHealth, events, ack };
 }
 
-// Motion inside a camera's zones for 1 s raises an alert (10 s cooldown per camera).
-function useDetector(stream, zones, armed, onAlert) {
-  const live = useRef({});
-  live.current = { zones, armed, onAlert };
-  useEffect(() => {
-    if (!stream) return;
-    const v = document.createElement("video");
-    v.srcObject = stream; v.muted = true; v.play().catch(() => {});
-    const c = document.createElement("canvas"); c.width = 64; c.height = 36;
-    const g = c.getContext("2d", { willReadFrequently: true });
-    const snap = document.createElement("canvas"); snap.width = 320; snap.height = 180;
-    let prev = null; const since = {}, last = {};
-    const t = setInterval(() => {
-      if (v.readyState < 2) return;
-      g.drawImage(v, 0, 0, 64, 36);
-      const d = g.getImageData(0, 0, 64, 36).data;
-      const p = prev; prev = d;
-      if (!p) return;
-      const { zones, armed, onAlert } = live.current, now = Date.now();
-      for (const cam of CAMS) {
-        const zs = zones[cam.id] || [];
-        if (!zs.length || !armed) { since[cam.id] = 0; continue; }
-        let n = 0, hit = 0;
-        for (let y = 0; y < 36; y++) for (let x = 0; x < 64; x++) {
-          const px = ((x + 0.5) / 64) * W, py = ((y + 0.5) / 36) * H;
-          if (!zs.some(s => inside(s, px, py))) continue;
-          n++; const i = (y * 64 + x) * 4;
-          if (Math.abs(d[i] - p[i]) + Math.abs(d[i + 1] - p[i + 1]) + Math.abs(d[i + 2] - p[i + 2]) > 90) hit++;
-        }
-        if (n && hit / n > 0.06) {
-          since[cam.id] = since[cam.id] || now;
-          if (now - since[cam.id] >= 1000 && now - (last[cam.id] || 0) > 10000) {
-            last[cam.id] = now;
-            snap.getContext("2d").drawImage(v, 0, 0, 320, 180);
-            onAlert(cam, snap.toDataURL("image/jpeg", 0.6));
-          }
-        } else since[cam.id] = 0;
-      }
-    }, 250);
-    return () => clearInterval(t);
-  }, [stream]);
-}
+// One video connection from the backend, copied into every tile (browsers allow only ~6 per site).
+const Src = createContext({ img: { current: null }, live: false });
 
 const Shape = ({ s, draft }) => {
   const p = { className: draft ? "zone draft" : "zone" };
@@ -101,20 +70,32 @@ const Shape = ({ s, draft }) => {
   return <polygon points={s.pts.map(q => q.join(",")).join(" ")} {...p} />;
 };
 
-function Feed({ stream, zones, hot, children }) {
-  const ref = useRef();
-  useEffect(() => { if (ref.current && stream) ref.current.srcObject = stream; }, [stream]);
+function Feed({ zones, hot, children }) {
+  const { img, live } = useContext(Src);
+  const cv = useRef();
+  useEffect(() => {
+    let raf, t = 0;
+    const tick = ts => {
+      raf = requestAnimationFrame(tick);
+      if (ts - t < 66) return;
+      t = ts;
+      const i = img.current, c = cv.current;
+      if (i?.naturalWidth && c) c.getContext("2d").drawImage(i, 0, 0, c.width, c.height);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [img]);
   return (
     <div className={"feed" + (hot ? " hot" : "")}>
-      <video ref={ref} autoPlay muted playsInline />
-      {!stream && <span className="nofeed">No webcam feed</span>}
+      <canvas ref={cv} width="640" height="360" />
+      {!live && <span className="nofeed">No video</span>}
       <svg viewBox={`0 0 ${W} ${H}`} className="shapes">{zones.map((s, i) => <Shape key={i} s={s} />)}</svg>
       {children}
     </div>
   );
 }
 
-function Editor({ cam, stream, zones, setZones, hot }) {
+function Editor({ cam, zones, setZones, hot }) {
   const [tool, setTool] = useState("circle");
   const [draft, setDraft] = useState(null);
   const svg = useRef();
@@ -144,7 +125,7 @@ function Editor({ cam, stream, zones, setZones, hot }) {
   const hints = { circle: "Click and drag from the center outward.", rect: "Click and drag across the area.", poly: "Click each corner. Click the first point to close the shape." };
   return (
     <div className="cam-layout">
-      <Feed stream={stream} zones={zones} hot={hot}>
+      <Feed zones={zones} hot={hot}>
         <svg ref={svg} viewBox={`0 0 ${W} ${H}`} className="draw" onPointerDown={down} onPointerMove={move} onPointerUp={up}>
           {draft && <Shape s={draft} draft />}
           {draft?.t === "poly" && draft.pts.map((q, i) => <circle key={i} cx={q[0]} cy={q[1]} r="0.08" className="dot" />)}
@@ -202,90 +183,107 @@ function Login({ onLogin }) {
 }
 
 function Dashboard({ user, onLogout }) {
-  const { stream, error } = useWebcam();
+  const { health, setHealth, events, ack } = useBackend();
   const [view, setView] = useState(0);
   const [zones, setZonesState] = useState(() => load("argus.zones", {}));
-  const [notes, setNotes] = useState(() => load("argus.notes", []));
-  const [armed, setArmed] = useState(true);
   const [panel, setPanel] = useState(false);
   const [now, setNow] = useState(Date.now());
+  const imgRef = useRef(null);
+  const online = !!health, live = !!health?.online;
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
-  const setZones = (id, list) => setZonesState(z => { const n = { ...z, [id]: list }; save("argus.zones", n); return n; });
-  const addNote = useCallback((cam, label, img) => setNotes(l => {
-    const n = [{ id: Date.now() + Math.random(), cam: cam.id, label, ts: Date.now(), img, read: false }, ...l].slice(0, 30);
-    save("argus.notes", n); return n;
-  }), []);
-  useDetector(stream, zones, armed, (cam, img) => addNote(cam, `Movement in the ${cam.name} zone`, img));
-  const hot = new Set(notes.filter(n => now - n.ts < 8000).map(n => n.cam));
-  const unread = notes.filter(n => !n.read).length;
-  const today = notes.filter(n => new Date(n.ts).toDateString() === new Date().toDateString()).length;
+  const push = (id, list) => api(`/api/cameras/${id}/zone`, "PUT", { zones: list.map(toPoly) }).catch(() => {});
+  const setZones = (id, list) => setZonesState(z => { const n = { ...z, [id]: list }; save("argus.zones", n); return n; }) || push(id, list);
+  const synced = useRef(false);
+  useEffect(() => {            // when the backend comes up, send it the zones saved in this browser
+    if (!online) { synced.current = false; return; }
+    if (synced.current) return;
+    synced.current = true;
+    const saved = load("argus.zones", {});
+    CAMS.forEach(c => push(c.id, saved[c.id] || []));
+  }, [online]);
+  const toggleArm = () => api("/api/arm", "PUT", { armed: !health.armed }).then(r => setHealth(h => ({ ...h, armed: r.armed }))).catch(() => {});
+  const pickColor = c => api("/api/detector", "PUT", { color: c }).then(r => setHealth(h => ({ ...h, color: r.color, mode: r.mode }))).catch(() => {});
+  const camOf = n => n.cam || 1;
+  const hot = new Set([...(health?.alerts || []), ...events.filter(n => now - n.ts * 1000 < 8000).map(camOf)]);
+  const unread = events.filter(n => n.status === "new").length;
+  const today = events.filter(n => new Date(n.ts * 1000).toDateString() === new Date().toDateString()).length;
   const zoneCount = Object.values(zones).reduce((a, l) => a + l.length, 0);
-  const open = n => { setNotes(l => { const x = l.map(m => (m.id === n.id ? { ...m, read: true } : m)); save("argus.notes", x); return x; }); setView(n.cam); setPanel(false); };
-  const readAll = () => setNotes(l => { const x = l.map(m => ({ ...m, read: true })); save("argus.notes", x); return x; });
-  const test = () => { const c = CAMS[Math.floor(Math.random() * CAMS.length)]; addNote(c, `Test alert from ${c.name}`); };
+  const open = n => { ack([n.id]); setView(camOf(n)); setPanel(false); };
+  const readAll = () => ack(events.filter(n => n.status === "new").map(n => n.id));
+  const test = () => api("/api/dev/fake-event", "POST", { cam: 1 + Math.floor(Math.random() * CAMS.length) }).catch(() => {});
   const cam = CAMS.find(c => c.id === view);
-  const stats = [["Cameras online", stream ? CAMS.length : 0], ["Alerts today", today], ["Zones drawn", zoneCount], ["Unread alerts", unread]];
+  const stats = [["Cameras online", live ? CAMS.length : 0], ["Alerts today", today], ["Zones drawn", zoneCount], ["Unread alerts", unread]];
+  const banner = !online ? "Can't reach the backend. Open a terminal in the backend folder and run: python app.py"
+    : !live ? "The backend is running but isn't getting video. Close any other program using the webcam, or start it with SOURCE set to a video file." : "";
 
   return (
-    <div className="page">
-      <div className={"shell" + (panel ? " show-panel" : "")}>
-        <aside className="side">
-          <div className="logo">Argus</div>
-          <nav aria-label="Main">
-            <p className="group">Dashboards</p>
-            <button className={"nav" + (!view ? " on" : "")} onClick={() => setView(0)}><Icon n="grid" />Overview</button>
-            <p className="group">Cameras</p>
-            {CAMS.map(c => (
-              <button key={c.id} className={"nav" + (view === c.id ? " on" : "")} onClick={() => setView(c.id)}>
-                <Icon n="cam" />{c.name}{hot.has(c.id) && <span className="pulse" aria-label="Alert" />}
-              </button>
-            ))}
-          </nav>
-          <div className="spacer" />
-          <div className="user"><span>{user.name}</span><button className="quiet" onClick={onLogout} aria-label="Sign out"><Icon n="out" /></button></div>
-        </aside>
+    <Src.Provider value={{ img: imgRef, live }}>
+      <img key={live ? "on" : "off"} ref={imgRef} className="src" alt="" src={live ? "/api/cameras/1/stream" : undefined} />
+      <div className="page">
+        <div className={"shell" + (panel ? " show-panel" : "")}>
+          <aside className="side">
+            <div className="logo">Argus</div>
+            <nav aria-label="Main">
+              <p className="group">Dashboards</p>
+              <button className={"nav" + (!view ? " on" : "")} onClick={() => setView(0)}><Icon n="grid" />Overview</button>
+              <p className="group">Cameras</p>
+              {CAMS.map(c => (
+                <button key={c.id} className={"nav" + (view === c.id ? " on" : "")} onClick={() => setView(c.id)}>
+                  <Icon n="cam" />{c.name}{hot.has(c.id) && <span className="pulse" aria-label="Alert" />}
+                </button>
+              ))}
+            </nav>
+            <div className="spacer" />
+            <div className="user"><span>{user.name}</span><button className="quiet" onClick={onLogout} aria-label="Sign out"><Icon n="out" /></button></div>
+          </aside>
 
-        <section className="main">
-          <header className="top">
-            <p className="crumb">{cam ? "Cameras" : "Dashboards"} <span>/</span> <b>{cam ? cam.name : "Overview"}</b></p>
-            <label className="switch"><input type="checkbox" checked={armed} onChange={() => setArmed(a => !a)} /><i />{armed ? "Armed" : "Disarmed"}</label>
-            <button className="quiet bell" onClick={() => setPanel(p => !p)} aria-label="Notifications"><Icon n="bell" />{unread > 0 && <b>{unread}</b>}</button>
-          </header>
-          <div className="body">
-            {error && <p className="banner" role="alert">{error}</p>}
-            {!cam ? (
-              <>
-                <div className="stats">{stats.map(([l, v]) => <div key={l} className="stat"><span>{l}</span><strong>{v}</strong></div>)}</div>
-                <div className="card"><h3>All cameras</h3>
-                  <div className="grid">
-                    {CAMS.map(c => (
-                      <button key={c.id} className="tile" onClick={() => setView(c.id)}>
-                        <Feed stream={stream} zones={zones[c.id] || []} hot={hot.has(c.id)} />
-                        <span>{c.name}</span><em>{(zones[c.id] || []).length} zones</em>
-                      </button>
-                    ))}
+          <section className="main">
+            <header className="top">
+              <p className="crumb">{cam ? "Cameras" : "Dashboards"} <span>/</span> <b>{cam ? cam.name : "Overview"}</b></p>
+              <label className="pick">Watching for
+                <select value={health?.color || "red"} disabled={!online || health.mode !== "color"} onChange={e => pickColor(e.target.value)}>
+                  {COLORS.map(c => <option key={c} value={c}>{c[0].toUpperCase() + c.slice(1)} objects</option>)}
+                </select>
+              </label>
+              <label className="switch"><input type="checkbox" checked={!!health?.armed} disabled={!online} onChange={toggleArm} /><i />{health?.armed ? "Armed" : "Disarmed"}</label>
+              <button className="quiet bell" onClick={() => setPanel(p => !p)} aria-label="Notifications"><Icon n="bell" />{unread > 0 && <b>{unread}</b>}</button>
+            </header>
+            <div className="body">
+              {banner && <p className="banner" role="alert">{banner}</p>}
+              {!cam ? (
+                <>
+                  <div className="stats">{stats.map(([l, v]) => <div key={l} className="stat"><span>{l}</span><strong>{v}</strong></div>)}</div>
+                  <div className="card"><h3>All cameras</h3>
+                    <div className="grid">
+                      {CAMS.map(c => (
+                        <button key={c.id} className="tile" onClick={() => setView(c.id)}>
+                          <Feed zones={zones[c.id] || []} hot={hot.has(c.id)} />
+                          <span>{c.name}</span><em>{(zones[c.id] || []).length} zones</em>
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              </>
-            ) : <Editor key={cam.id} cam={cam} stream={stream} zones={zones[cam.id] || []} setZones={setZones} hot={hot.has(cam.id)} />}
-          </div>
-        </section>
+                </>
+              ) : <Editor key={cam.id} cam={cam} zones={zones[cam.id] || []} setZones={setZones} hot={hot.has(cam.id)} />}
+            </div>
+          </section>
 
-        <aside className="notes" aria-label="Notifications">
-          <div className="nh"><h3>Notifications</h3><button className="quiet" onClick={readAll}>Mark all read</button></div>
-          {notes.length === 0 && <p className="muted">No alerts yet. Draw a zone on a camera, then move inside it.</p>}
-          <ul>
-            {notes.map(n => (
-              <li key={n.id}><button onClick={() => open(n)} className={n.read ? "" : "unread"}>
-                {n.img ? <img src={n.img} alt="" /> : <span className="ico"><Icon n="bell" /></span>}
-                <span><b>{n.label}</b><small>{ago(n.ts)}</small></span>
-              </button></li>
-            ))}
-          </ul>
-          <button className="quiet test" onClick={test}>Send test alert</button>
-        </aside>
+          <aside className="notes" aria-label="Notifications">
+            <div className="nh"><h3>Notifications</h3><button className="quiet" onClick={readAll}>Mark all read</button></div>
+            {events.length === 0 && <p className="muted">No alerts yet. Draw a zone on a camera, then put the watched color inside it.</p>}
+            <ul>
+              {events.map(n => (
+                <li key={n.id}><button onClick={() => open(n)} className={n.status === "new" ? "unread" : ""}>
+                  {n.snapshot ? <img src={n.snapshot} alt="" /> : <span className="ico"><Icon n="bell" /></span>}
+                  <span><b>{n.label}</b><small>{ago(n.ts * 1000)}</small></span>
+                </button></li>
+              ))}
+            </ul>
+            <button className="quiet test" onClick={test} disabled={!online}>Send test alert</button>
+          </aside>
+        </div>
       </div>
-    </div>
+    </Src.Provider>
   );
 }
 

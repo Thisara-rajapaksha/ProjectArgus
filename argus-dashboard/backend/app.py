@@ -38,7 +38,8 @@ COLORS = {  # HSV ranges (OpenCV hue is 0-179). Red wraps around, so it has two 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MEDIA = os.path.join(HERE, "media")
 DB = os.path.join(HERE, "guard.db")
-ZONE_FILE = os.path.join(HERE, "zone.json")
+ZONES_FILE = os.path.join(HERE, "zones.json")
+CAMS = ["Front door", "Garage", "Back yard", "Lobby", "Parking", "Side gate"]   # all six show the same camera for now
 os.makedirs(MEDIA, exist_ok=True)
 if "://" in SOURCE:                               # TCP is more reliable for CCTV streams
     os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
@@ -49,7 +50,7 @@ hog = cv2.HOGDescriptor()
 hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
 
 model, WATCH_IDS = None, []
-if os.environ.get("DETECTOR", "yolo") == "yolo":
+if os.environ.get("DETECTOR", "color") == "yolo":
     try:
         from ultralytics import YOLO
         model = YOLO(os.environ.get("MODEL", "yolov8n.pt"))       # downloads on first run
@@ -58,10 +59,17 @@ if os.environ.get("DETECTOR", "yolo") == "yolo":
     except ImportError:
         print("ultralytics is not installed, so using the basic HOG person detector")
 
+def load_zones():
+    try:
+        return {int(k): v for k, v in json.load(open(ZONES_FILE)).items()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
 state = {"armed": True, "online": False, "fps": 0.0, "alert": False,
          "mode": os.environ.get("DETECTOR", "color"),
          "color": os.environ.get("COLOR", "red") if os.environ.get("COLOR", "red") in COLORS else "red",
-         "zone": json.load(open(ZONE_FILE)) if os.path.exists(ZONE_FILE) else None}
+         "zones": load_zones(), "alerts": []}
 latest = {"jpeg": None, "raw": None}              # newest picture / newest clean frame
 people = []                                       # [(x, y, w, h, score)] in 0..1
 subscribers = []                                  # one queue per open event stream
@@ -78,17 +86,19 @@ with db() as c:
     c.execute("""CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, type TEXT, label TEXT,
         score REAL, snapshot TEXT, status TEXT DEFAULT 'new')""")
+    if "cam" not in [r[1] for r in c.execute("PRAGMA table_info(events)")]:
+        c.execute("ALTER TABLE events ADD COLUMN cam INTEGER DEFAULT 1")
 
 
-def add_event(kind, label, score, jpeg):
+def add_event(kind, label, score, jpeg, cam=1):
     ts = time.time()
     name = f"{int(ts * 1000)}.jpg"
     if jpeg:
         with open(os.path.join(MEDIA, name), "wb") as f:
             f.write(jpeg)
     with db() as c:
-        cur = c.execute("INSERT INTO events (ts, type, label, score, snapshot) VALUES (?,?,?,?,?)",
-                        (ts, kind, label, score, f"/media/{name}" if jpeg else None))
+        cur = c.execute("INSERT INTO events (ts, type, label, score, snapshot, cam) VALUES (?,?,?,?,?,?)",
+                        (ts, kind, label, score, f"/media/{name}" if jpeg else None, cam))
         row = dict(c.execute("SELECT * FROM events WHERE id=?", (cur.lastrowid,)).fetchone())
     for q in list(subscribers):                   # push to every open dashboard
         q.put(json.dumps(row))
@@ -96,11 +106,9 @@ def add_event(kind, label, score, jpeg):
 
 
 # ---------- video ----------
-def zone_poly(w, h):
-    z = state["zone"]
-    if not z:
-        return None
-    return np.array([[int(x * w), int(y * h)] for x, y in z], np.int32).reshape(-1, 1, 2)
+def zone_polys(cid, w, h):
+    return [np.array([[int(x * w), int(y * h)] for x, y in z], np.int32).reshape(-1, 1, 2)
+            for z in state["zones"].get(cid, [])]
 
 
 def publish(frame):
@@ -111,9 +119,6 @@ def publish(frame):
 
 def draw(frame):
     h, w = frame.shape[:2]
-    poly = zone_poly(w, h)
-    if poly is not None:
-        cv2.polylines(frame, [poly], True, (0, 0, 255) if state["alert"] else (0, 200, 0), 3)
     for x, y, bw, bh, s, name in list(people):
         x1, y1, x2, y2 = int(x * w), int(y * h), int((x + bw) * w), int((y + bh) * h)
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
@@ -122,7 +127,9 @@ def draw(frame):
 
 
 def open_source():
-    return cv2.VideoCapture(int(SOURCE) if SOURCE.isdigit() else SOURCE)
+    if SOURCE.isdigit():                          # DirectShow avoids the MSMF "can't grab frame" warning on Windows
+        return cv2.VideoCapture(int(SOURCE), cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(int(SOURCE))
+    return cv2.VideoCapture(SOURCE)
 
 
 def capture_loop():
@@ -211,9 +218,10 @@ def find_objects(frame):
 
 
 def detect_loop():
-    """Find people, check whether their feet are in the zone, raise a loitering alert."""
+    """Find objects, check each camera's zones, raise a loitering alert per camera."""
     global people
-    last, since, last_seen, alerted = None, None, 0.0, False
+    last = None
+    track = {i: {"since": None, "seen": 0.0, "alerted": False} for i in range(1, len(CAMS) + 1)}
     while True:
         raw = latest["raw"]
         if raw is None or raw is last:
@@ -224,24 +232,28 @@ def detect_loop():
             h, w = raw.shape[:2]
             found = find_objects(raw)
             people = found
-            poly, inside = zone_poly(w, h), None
-            if poly is not None:
+            now = time.time()
+            for cid, t in track.items():
+                polys, inside = zone_polys(cid, w, h), None
                 for x, y, bw, bh, s, name in found:
-                    feet = (float((x + bw / 2) * w), float(min((y + bh * anchor_y()) * h, h - 1)))
-                    if cv2.pointPolygonTest(poly, feet, False) >= 0:
+                    pt = (float((x + bw / 2) * w), float(min((y + bh * anchor_y()) * h, h - 1)))
+                    if any(cv2.pointPolygonTest(p, pt, False) >= 0 for p in polys):
                         inside = (s, name)
                         break
-            now = time.time()
-            if inside is not None:
-                since = since or now
-                last_seen = now
-                state["alert"] = True
-                if state["armed"] and not alerted and now - since >= LOITER_SECONDS:
-                    alerted = True
-                    add_event("loitering", f"{inside[1].capitalize()} in the zone for {now - since:.0f} s",
-                              inside[0], latest["jpeg"])
-            elif since and now - last_seen > 2:       # zone empty for 2 s: reset
-                since, alerted, state["alert"] = None, False, False
+                if inside is not None:
+                    t["since"] = t["since"] or now
+                    t["seen"] = now
+                    if cid not in state["alerts"]:
+                        state["alerts"].append(cid)
+                    if state["armed"] and not t["alerted"] and now - t["since"] >= LOITER_SECONDS:
+                        t["alerted"] = True
+                        add_event("loitering", f"{inside[1].capitalize()} in the {CAMS[cid - 1]} zone for {now - t['since']:.0f} s",
+                                  inside[0], latest["jpeg"], cid)
+                elif t["since"] and now - t["seen"] > 2:      # zone empty for 2 s: reset
+                    t["since"], t["alerted"] = None, False
+                    if cid in state["alerts"]:
+                        state["alerts"].remove(cid)
+            state["alert"] = bool(state["alerts"])
         except Exception as e:                        # keep the thread alive
             print("detection error:", e)
             time.sleep(1)
@@ -266,8 +278,8 @@ def cpu_temp():
 # ---------- API ----------
 @app.get("/api/cameras")
 def cameras():
-    return jsonify([{"id": 1, "name": "Camera 1", "online": state["online"],
-                     "armed": state["armed"], "zone": state["zone"]}])
+    return jsonify([{"id": i + 1, "name": n, "online": state["online"], "armed": state["armed"],
+                     "zones": state["zones"].get(i + 1, [])} for i, n in enumerate(CAMS)])
 
 
 @app.get("/api/cameras/<int:cid>/stream")
@@ -282,20 +294,25 @@ def snapshot(cid):
 
 @app.route("/api/cameras/<int:cid>/zone", methods=["GET", "PUT"])
 def zone(cid):
-    """PUT {"zone": [[x, y], ...]} with x, y in 0..1, or {"zone": null} to remove it."""
+    """PUT {"zones": [[[x, y], ...], ...]}: x, y in 0..1, one list of points per shape. [] removes them all."""
+    if not 1 <= cid <= len(CAMS):
+        return jsonify(error="unknown camera"), 404
     if request.method == "PUT":
-        z = (request.get_json(silent=True) or {}).get("zone")
-        if z is not None:
-            try:
-                z = [[min(1.0, max(0.0, float(x))), min(1.0, max(0.0, float(y)))] for x, y in z]
-            except (TypeError, ValueError):
-                return jsonify(error="bad zone"), 400
-            if not 3 <= len(z) <= 200:
-                return jsonify(error="a zone needs 3 to 200 points"), 400
-        state["zone"], state["alert"] = z, False
-        with open(ZONE_FILE, "w") as f:
-            json.dump(z, f)
-    return jsonify(zone=state["zone"])
+        zs = (request.get_json(silent=True) or {}).get("zones")
+        if not isinstance(zs, list) or len(zs) > 20:
+            return jsonify(error="zones must be a list of up to 20 shapes"), 400
+        try:
+            zs = [[[min(1.0, max(0.0, float(x))), min(1.0, max(0.0, float(y)))] for x, y in z] for z in zs]
+        except (TypeError, ValueError):
+            return jsonify(error="bad zone"), 400
+        if any(not 3 <= len(z) <= 200 for z in zs):
+            return jsonify(error="a zone needs 3 to 200 points"), 400
+        state["zones"][cid] = zs
+        if cid in state["alerts"]:
+            state["alerts"].remove(cid)
+        with open(ZONES_FILE, "w") as f:
+            json.dump({str(k): v for k, v in state["zones"].items()}, f)
+    return jsonify(zones=state["zones"].get(cid, []))
 
 
 @app.get("/api/events")
@@ -341,7 +358,7 @@ def arm():
 
 @app.get("/api/health")
 def health():
-    return jsonify(**{k: state[k] for k in ("online", "armed", "fps", "alert", "mode", "color")}, cpu_temp=cpu_temp())
+    return jsonify(**{k: state[k] for k in ("online", "armed", "fps", "alert", "alerts", "mode", "color")}, cpu_temp=cpu_temp())
 
 
 @app.route("/api/detector", methods=["GET", "PUT"])
@@ -357,7 +374,9 @@ def detector():
 
 @app.post("/api/dev/fake-event")
 def fake_event():                                 # to test the dashboard without detection
-    return jsonify(add_event("test", "Test event (fake)", 0.99, latest["jpeg"]))
+    cid = (request.get_json(silent=True) or {}).get("cam", 1)
+    cid = cid if isinstance(cid, int) and 1 <= cid <= len(CAMS) else 1
+    return jsonify(add_event("test", f"Test alert from {CAMS[cid - 1]}", 0.99, latest["jpeg"], cid))
 
 
 @app.get("/media/<path:name>")
